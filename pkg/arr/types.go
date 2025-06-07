@@ -18,6 +18,7 @@ type Movie struct {
 type ContentFile struct {
 	Name         string `json:"name"`
 	Path         string `json:"path"`
+	RealPath     string `json:"realPath"`
 	Id           int    `json:"id"`
 	EpisodeId    int    `json:"showId"`
 	FileId       int    `json:"fileId"`

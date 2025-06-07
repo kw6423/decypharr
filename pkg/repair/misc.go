@@ -90,8 +90,37 @@ func (r *Repair) checkTorrentFiles(torrentPath string, files []arr.ContentFile, 
 
 	r.logger.Debug().Msgf("Checking %s", torrentPath)
 
+	if torrentPath == "" {
+		r.logger.Debug().Msgf("Torrent path is empty. Skipping")
+		return files // Return all files as broken if no torrent path
+	}
+
+	// Check if the torrent path exists
+	if _, err := os.Stat(torrentPath); os.IsNotExist(err) {
+		r.logger.Debug().Msgf("Torrent path %s does not exist. Marking all files as broken", torrentPath)
+		for _, file := range files {
+			file.IsBroken = true
+			brokenFiles = append(brokenFiles, file)
+		}
+		return brokenFiles // Return all files as broken if torrent path does not exist
+	}
+
+	// Check each file availability
+	for _, file := range files {
+		if _, err := os.Stat(filepath.Join(torrentPath, file.TargetPath)); os.IsNotExist(err) {
+			r.logger.Debug().Msgf("File %s does not exist in %s. Marking as broken", file.TargetPath, torrentPath)
+			file.IsBroken = true
+			brokenFiles = append(brokenFiles, file)
+		}
+	}
+
+	if len(files) == len(brokenFiles) {
+		r.logger.Debug().Msgf("All files in %s are broken", torrentPath)
+		return brokenFiles // Return all files as broken if all files are marked as broken
+	}
+
 	// Get the debrid client
-	dir := filepath.Dir(torrentPath)
+	dir := filepath.Dir(torrentPath) // strip the torrent name to get the directory
 	debridName := r.findDebridForPath(dir, clients)
 	if debridName == "" {
 		r.logger.Debug().Msgf("No debrid found for %s. Skipping", torrentPath)
