@@ -2,7 +2,6 @@ package request
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -10,10 +9,9 @@ import (
 	"fmt"
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/logger"
+	"go.uber.org/ratelimit"
 	"golang.org/x/net/proxy"
-	"golang.org/x/time/rate"
 	"io"
-	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -53,7 +51,7 @@ type ClientOption func(*Client)
 // Client represents an HTTP client with additional capabilities
 type Client struct {
 	client          *http.Client
-	rateLimiter     *rate.Limiter
+	rateLimiter     ratelimit.Limiter
 	headers         map[string]string
 	headersMu       sync.RWMutex
 	maxRetries      int
@@ -85,7 +83,7 @@ func WithRedirectPolicy(policy func(req *http.Request, via []*http.Request) erro
 }
 
 // WithRateLimiter sets a rate limiter
-func WithRateLimiter(rl *rate.Limiter) ClientOption {
+func WithRateLimiter(rl ratelimit.Limiter) ClientOption {
 	return func(c *Client) {
 		c.rateLimiter = rl
 	}
@@ -137,9 +135,11 @@ func WithProxy(proxyURL string) ClientOption {
 // doRequest performs a single HTTP request with rate limiting
 func (c *Client) doRequest(req *http.Request) (*http.Response, error) {
 	if c.rateLimiter != nil {
-		err := c.rateLimiter.Wait(req.Context())
-		if err != nil {
-			return nil, fmt.Errorf("rate limiter wait: %w", err)
+		select {
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		default:
+			c.rateLimiter.Take()
 		}
 	}
 
@@ -340,7 +340,10 @@ func New(options ...ClientOption) *Client {
 	return client
 }
 
-func ParseRateLimit(rateStr string) *rate.Limiter {
+func ParseRateLimit(rateStr string) ratelimit.Limiter {
+	if rateStr == "" {
+		return nil
+	}
 	parts := strings.SplitN(rateStr, "/", 2)
 	if len(parts) != 2 {
 		return nil
@@ -352,23 +355,21 @@ func ParseRateLimit(rateStr string) *rate.Limiter {
 		return nil
 	}
 
+	// Set slack size to 10%
+	slackSize := count / 10
+
 	// normalize unit
 	unit := strings.ToLower(strings.TrimSpace(parts[1]))
 	unit = strings.TrimSuffix(unit, "s")
-	burstSize := int(math.Ceil(float64(count) * 0.1))
-	if burstSize < 1 {
-		burstSize = 1
-	}
-	if burstSize > count {
-		burstSize = count
-	}
 	switch unit {
 	case "minute", "min":
-		return rate.NewLimiter(rate.Limit(float64(count)/60.0), burstSize)
+		return ratelimit.New(count, ratelimit.Per(time.Minute), ratelimit.WithSlack(slackSize))
 	case "second", "sec":
-		return rate.NewLimiter(rate.Limit(float64(count)), burstSize)
+		return ratelimit.New(count, ratelimit.Per(time.Second), ratelimit.WithSlack(slackSize))
 	case "hour", "hr":
-		return rate.NewLimiter(rate.Limit(float64(count)/3600.0), burstSize)
+		return ratelimit.New(count, ratelimit.Per(time.Hour), ratelimit.WithSlack(slackSize))
+	case "day", "d":
+		return ratelimit.New(count, ratelimit.Per(24*time.Hour), ratelimit.WithSlack(slackSize))
 	default:
 		return nil
 	}
@@ -381,31 +382,6 @@ func JSONResponse(w http.ResponseWriter, data interface{}, code int) {
 	if err != nil {
 		return
 	}
-}
-
-func Gzip(body []byte) []byte {
-	if len(body) == 0 {
-		return nil
-	}
-
-	// Check if the pool is nil
-	buf := bytes.NewBuffer(make([]byte, 0, len(body)))
-
-	gz, err := gzip.NewWriterLevel(buf, gzip.BestSpeed)
-	if err != nil {
-		return nil
-	}
-
-	if _, err := gz.Write(body); err != nil {
-		return nil
-	}
-	if err := gz.Close(); err != nil {
-		return nil
-	}
-	result := make([]byte, buf.Len())
-	copy(result, buf.Bytes())
-
-	return result
 }
 
 func Default() *Client {
@@ -435,7 +411,7 @@ func isRetryableError(err error) bool {
 	var netErr net.Error
 	if errors.As(err, &netErr) {
 		// Retry on timeout errors and temporary errors
-		return netErr.Timeout() || netErr.Temporary()
+		return netErr.Timeout()
 	}
 
 	// Not a retryable error

@@ -15,7 +15,7 @@ Here are the fundamental configuration options:
   "min_file_size": 0,
   "max_file_size": 0,
   "allowed_file_types": ["mp4", "mkv", "avi", ...],
-
+  
 }
 ```
 
@@ -56,8 +56,8 @@ When enabled, you'll need to provide a username and password to access the Decyp
 You can set minimum and maximum file size limits for torrents:
 
 ```json
-"min_file_size": 0,  // Minimum file size in bytes (0 = no minimum)
-"max_file_size": 0   // Maximum file size in bytes (0 = no maximum)
+"min_file_size": 0,
+"max_file_size": 0
 ```
 
 #### Allowed File Types

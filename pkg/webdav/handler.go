@@ -2,7 +2,10 @@ package webdav
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/sirrobot01/decypharr/pkg/debrid/types"
+	"golang.org/x/net/webdav"
 	"io"
 	"mime"
 	"net/http"
@@ -15,21 +18,21 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/utils"
-	"github.com/sirrobot01/decypharr/pkg/debrid/debrid"
-	"github.com/sirrobot01/decypharr/pkg/debrid/types"
+	"github.com/sirrobot01/decypharr/pkg/debrid/store"
 	"github.com/sirrobot01/decypharr/pkg/version"
-	"golang.org/x/net/webdav"
 )
+
+const DeleteAllBadTorrentKey = "DELETE_ALL_BAD_TORRENTS"
 
 type Handler struct {
 	Name     string
 	logger   zerolog.Logger
-	cache    *debrid.Cache
+	cache    *store.Cache
 	URLBase  string
 	RootPath string
 }
 
-func NewHandler(name, urlBase string, cache *debrid.Cache, logger zerolog.Logger) *Handler {
+func NewHandler(name, urlBase string, cache *store.Cache, logger zerolog.Logger) *Handler {
 	h := &Handler{
 		Name:     name,
 		cache:    cache,
@@ -179,7 +182,7 @@ func (h *Handler) getChildren(name string) []os.FileInfo {
 	if len(parts) == 2 && utils.Contains(h.getParentItems(), parts[0]) {
 		torrentName := parts[1]
 		if t := h.cache.GetTorrentByName(torrentName); t != nil {
-			return h.getFileInfos(t.Torrent)
+			return h.getFileInfos(t)
 		}
 	}
 	return nil
@@ -191,7 +194,7 @@ func (h *Handler) OpenFile(ctx context.Context, name string, flag int, perm os.F
 	}
 	name = utils.PathUnescape(path.Clean(name))
 	rootDir := path.Clean(h.RootPath)
-	metadataOnly := ctx.Value("metadataOnly") != nil
+	metadataOnly := ctx.Value(metadataOnlyKey) != nil
 	now := time.Now()
 
 	// 1) special case version.txt
@@ -245,6 +248,7 @@ func (h *Handler) OpenFile(ctx context.Context, name string, flag int, perm os.F
 						size:         file.Size,
 						link:         file.Link,
 						metadataOnly: metadataOnly,
+						isRar:        file.IsRar,
 						modTime:      cached.AddedOn,
 					}, nil
 				}
@@ -265,10 +269,9 @@ func (h *Handler) Stat(ctx context.Context, name string) (os.FileInfo, error) {
 	return f.Stat()
 }
 
-func (h *Handler) getFileInfos(torrent *types.Torrent) []os.FileInfo {
+func (h *Handler) getFileInfos(torrent *store.CachedTorrent) []os.FileInfo {
 	torrentFiles := torrent.GetFiles()
 	files := make([]os.FileInfo, 0, len(torrentFiles))
-	now := time.Now()
 
 	// Sort by file name since the order is lost when using the map
 	sortedFiles := make([]*types.File, 0, len(torrentFiles))
@@ -284,7 +287,7 @@ func (h *Handler) getFileInfos(torrent *types.Torrent) []os.FileInfo {
 			name:    file.Name,
 			size:    file.Size,
 			mode:    0644,
-			modTime: now,
+			modTime: torrent.AddedOn,
 			isDir:   false,
 		})
 	}
@@ -307,7 +310,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handlePropfind(w, r)
 		return
 	case "DELETE":
-		if err := h.handleIDDelete(w, r); err == nil {
+		if err := h.handleDelete(w, r); err == nil {
 			return
 		}
 		// fallthrough to default
@@ -326,7 +329,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	handler.ServeHTTP(w, r)
-	return
 }
 
 func getContentType(fileName string) string {
@@ -387,21 +389,23 @@ func (h *Handler) serveDirectory(w http.ResponseWriter, r *http.Request, file we
 
 	// Prepare template data
 	data := struct {
-		Path       string
-		ParentPath string
-		ShowParent bool
-		Children   []os.FileInfo
-		URLBase    string
-		IsBadPath  bool
-		CanDelete  bool
+		Path                   string
+		ParentPath             string
+		ShowParent             bool
+		Children               []os.FileInfo
+		URLBase                string
+		IsBadPath              bool
+		CanDelete              bool
+		DeleteAllBadTorrentKey string
 	}{
-		Path:       cleanPath,
-		ParentPath: parentPath,
-		ShowParent: showParent,
-		Children:   children,
-		URLBase:    h.URLBase,
-		IsBadPath:  isBadPath,
-		CanDelete:  canDelete,
+		Path:                   cleanPath,
+		ParentPath:             parentPath,
+		ShowParent:             showParent,
+		Children:               children,
+		URLBase:                h.URLBase,
+		IsBadPath:              isBadPath,
+		CanDelete:              canDelete,
+		DeleteAllBadTorrentKey: DeleteAllBadTorrentKey,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -410,98 +414,95 @@ func (h *Handler) serveDirectory(w http.ResponseWriter, r *http.Request, file we
 	}
 }
 
+// Handlers
+
 func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 	fRaw, err := h.OpenFile(r.Context(), r.URL.Path, os.O_RDONLY, 0)
 	if err != nil {
-		h.logger.Error().Err(err).
-			Str("path", r.URL.Path).
-			Msg("Failed to open file")
 		http.NotFound(w, r)
 		return
 	}
-	defer func(fRaw webdav.File) {
-		err := fRaw.Close()
-		if err != nil {
-			h.logger.Error().Err(err).Msg("Failed to close file")
-			return
-		}
-	}(fRaw)
+	defer fRaw.Close()
 
 	fi, err := fRaw.Stat()
 	if err != nil {
-		h.logger.Error().Err(err).Msg("Failed to stat file")
 		http.Error(w, "Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	// If the target is a directory, use your directory listing logic.
 	if fi.IsDir() {
 		h.serveDirectory(w, r, fRaw)
 		return
 	}
 
-	// Checks if the file is a torrent file
-	// .content is nil if the file is a torrent file
-	// .content means file is preloaded, e.g version.txt
-	if file, ok := fRaw.(*File); ok && file.content == nil {
-		link, err := file.getDownloadLink()
-		if err != nil {
-			h.logger.Debug().
-				Err(err).
-				Str("link", file.link).
-				Str("path", r.URL.Path).
-				Msg("Could not fetch download link")
-			http.Error(w, "Could not fetch download link", http.StatusPreconditionFailed)
-			return
-		}
-		if link == "" {
-			http.NotFound(w, r)
-			return
-		}
-		file.downloadLink = link
-		if h.cache.StreamWithRclone() {
-			// Redirect to the download link
-			http.Redirect(w, r, file.downloadLink, http.StatusTemporaryRedirect)
-			return
-		}
-	}
-
-	// ETags
+	// Set common headers
 	etag := fmt.Sprintf("\"%x-%x\"", fi.ModTime().Unix(), fi.Size())
 	w.Header().Set("ETag", etag)
+	w.Header().Set("Last-Modified", fi.ModTime().UTC().Format(http.TimeFormat))
 
-	// 7. Content-Type by extension
 	ext := filepath.Ext(fi.Name())
-	contentType := mime.TypeByExtension(ext)
-	if contentType == "" {
-		contentType = "application/octet-stream"
+	if contentType := mime.TypeByExtension(ext); contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
 	}
-	w.Header().Set("Content-Type", contentType)
 
-	rs, ok := fRaw.(io.ReadSeeker)
-	if !ok {
-		if r.Header.Get("Range") != "" {
-			http.Error(w, "Range not supported", http.StatusRequestedRangeNotSatisfiable)
+	// Handle File struct with direct streaming
+	if file, ok := fRaw.(*File); ok {
+		// Handle nginx proxy (X-Accel-Redirect)
+		if file.content == nil && !file.isRar && h.cache.StreamWithRclone() {
+			link, err := file.getDownloadLink()
+			if err != nil || link == "" {
+				http.Error(w, "Could not fetch download link", http.StatusPreconditionFailed)
+				return
+			}
+
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fi.Name()))
+			w.Header().Set("X-Accel-Redirect", link)
+			w.Header().Set("X-Accel-Buffering", "no")
+			http.Redirect(w, r, link, http.StatusFound)
 			return
 		}
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", fi.Size()))
-		w.Header().Set("Last-Modified", fi.ModTime().UTC().Format(http.TimeFormat))
-		w.Header().Set("Accept-Ranges", "bytes")
-		ctx := r.Context()
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			io.Copy(w, fRaw)
-		}()
-		select {
-		case <-ctx.Done():
-			h.logger.Debug().Msg("Client cancelled download")
-			return
-		case <-done:
+
+		if err := file.StreamResponse(w, r); err != nil {
+			var streamErr *streamError
+			if errors.As(err, &streamErr) {
+				// Handle client disconnections silently (just debug log)
+				if errors.Is(streamErr.Err, context.Canceled) || errors.Is(streamErr.Err, context.DeadlineExceeded) || streamErr.IsClientDisconnection {
+					return // Don't log as error or try to write response
+				}
+
+				if streamErr.StatusCode > 0 && !hasHeadersWritten(w) {
+					http.Error(w, streamErr.Error(), streamErr.StatusCode)
+				} else {
+					h.logger.Error().
+						Err(streamErr.Err).
+						Str("path", r.URL.Path).
+						Msg("Stream error")
+				}
+			} else {
+				// Generic error
+				if !hasHeadersWritten(w) {
+					http.Error(w, "Stream error", http.StatusInternalServerError)
+				} else {
+					h.logger.Error().
+						Err(err).
+						Str("path", r.URL.Path).
+						Msg("Stream error after headers written")
+				}
+			}
 		}
 		return
 	}
-	http.ServeContent(w, r, fi.Name(), fi.ModTime(), rs)
+
+	// Fallback to ServeContent for other webdav.File implementations
+	if rs, ok := fRaw.(io.ReadSeeker); ok {
+		http.ServeContent(w, r, fi.Name(), fi.ModTime(), rs)
+	} else {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", fi.Size()))
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.Copy(w, fRaw)
+	}
 }
 
 func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request) {
@@ -537,8 +538,8 @@ func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleDelete deletes a torrent from using id
-func (h *Handler) handleIDDelete(w http.ResponseWriter, r *http.Request) error {
+// handleDelete deletes a torrent by id, or all bad torrents if the id is DeleteAllBadTorrentKey
+func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) error {
 	cleanPath := path.Clean(r.URL.Path) // Remove any leading slashes
 
 	_, torrentId := path.Split(cleanPath)
@@ -546,12 +547,39 @@ func (h *Handler) handleIDDelete(w http.ResponseWriter, r *http.Request) error {
 		return os.ErrNotExist
 	}
 
-	cachedTorrent := h.cache.GetTorrent(torrentId)
+	if torrentId == DeleteAllBadTorrentKey {
+		return h.handleDeleteAll(w)
+	}
+
+	return h.handleDeleteById(w, torrentId)
+}
+
+func (h *Handler) handleDeleteById(w http.ResponseWriter, tId string) error {
+	cachedTorrent := h.cache.GetTorrent(tId)
 	if cachedTorrent == nil {
 		return os.ErrNotExist
 	}
 
 	h.cache.OnRemove(cachedTorrent.Id)
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+func (h *Handler) handleDeleteAll(w http.ResponseWriter) error {
+	badTorrents := h.cache.GetListing("__bad__")
+	if len(badTorrents) == 0 {
+		http.Error(w, "No bad torrents to delete", http.StatusNotFound)
+		return nil
+	}
+
+	for _, fi := range badTorrents {
+		tName := strings.TrimSpace(strings.SplitN(fi.Name(), "||", 2)[0])
+		t := h.cache.GetTorrentByName(tName)
+		if t != nil {
+			h.cache.OnRemove(t.Id)
+		}
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 	return nil
 }

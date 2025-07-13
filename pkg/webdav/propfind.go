@@ -8,21 +8,19 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
-var builderPool = sync.Pool{
+type contextKey string
 
-	New: func() interface{} {
-		buf := stringbuf.New("")
-		return buf
-	},
-}
+const (
+	// metadataOnlyKey is used to indicate that the request is for metadata only
+	metadataOnlyKey contextKey = "metadataOnly"
+)
 
 func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) {
 	// Setup context for metadata only
-	ctx := context.WithValue(r.Context(), "metadataOnly", true)
+	ctx := context.WithValue(r.Context(), metadataOnlyKey, true)
 	r = r.WithContext(ctx)
 
 	cleanPath := path.Clean(r.URL.Path)
@@ -57,7 +55,6 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) {
 		rawEntries = append(rawEntries, h.getChildren(cleanPath)...)
 	}
 
-	now := time.Now().UTC().Format("2006-01-02T15:04:05.000-07:00")
 	entries := make([]entry, 0, len(rawEntries)+1)
 	// Add the current file itself
 	entries = append(entries, entry{
@@ -65,7 +62,7 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) {
 		escName: xmlEscape(fi.Name()),
 		isDir:   fi.IsDir(),
 		size:    fi.Size(),
-		modTime: fi.ModTime().Format("2006-01-02T15:04:05.000-07:00"),
+		modTime: fi.ModTime().Format(time.RFC3339),
 	})
 	for _, info := range rawEntries {
 
@@ -81,13 +78,11 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) {
 			escName: xmlEscape(nm),
 			isDir:   info.IsDir(),
 			size:    info.Size(),
-			modTime: info.ModTime().Format("2006-01-02T15:04:05.000-07:00"),
+			modTime: info.ModTime().Format(time.RFC3339),
 		})
 	}
 
-	sb := builderPool.Get().(stringbuf.StringBuf)
-	sb.Reset()
-	defer builderPool.Put(sb)
+	sb := stringbuf.New("")
 
 	// XML header and main element
 	_, _ = sb.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
@@ -112,7 +107,7 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) {
 		}
 
 		_, _ = sb.WriteString(`<d:getlastmodified>`)
-		_, _ = sb.WriteString(now)
+		_, _ = sb.WriteString(e.modTime)
 		_, _ = sb.WriteString(`</d:getlastmodified>`)
 
 		_, _ = sb.WriteString(`<d:displayname>`)
