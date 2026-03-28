@@ -71,10 +71,16 @@ func Get() *Store {
 			scheduler:         scheduler,
 		}
 		if cfg.RemoveStalledAfter != "" {
+			instance.logger.Trace().Msg("Parsing remove_stalled_after from config")
 			removeStalledAfter, err := time.ParseDuration(cfg.RemoveStalledAfter)
 			if err == nil {
+				instance.logger.Trace().Str("removeStalledAfter", removeStalledAfter.String()).Msg("Successfully parsed remove_stalled_after from config!")
 				instance.removeStalledAfter = removeStalledAfter
+			} else {
+				instance.logger.Error().Err(err).Msg("Error parsing remove_stalled_after from config!")
 			}
+		} else {
+			instance.logger.Trace().Msg("remove_stalled_after not configured, stalled torrent cleanup disabled")
 		}
 	})
 	return instance

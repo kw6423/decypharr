@@ -7,6 +7,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/sirrobot01/decypharr/internal/logger"
 )
 
 func keyPair(hash, category string) string {
@@ -279,21 +281,76 @@ func (ts *TorrentStorage) Reset() {
 	ts.torrents = make(Torrents)
 }
 
-// GetStalledTorrents returns a list of torrents that are stalled
-// A torrent is considered stalled if it has no seeds, no progress, and has been downloading for longer than removeStalledAfter
-// The torrent must have a DebridID and be in the "downloading" state
+// GetStalledTorrents returns a list of torrents that are stalled.
+// A torrent is considered stalled if it is still downloading, has bytes left,
+// has no download speed, and has had no activity for longer than removeAfter.
 func (ts *TorrentStorage) GetStalledTorrents(removeAfter time.Duration) []*Torrent {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
 	stalled := make([]*Torrent, 0)
 	currentTime := time.Now()
+	log := logger.Default()
 	for _, torrent := range ts.torrents {
-		if torrent.DebridID != "" && torrent.State == "downloading" && torrent.NumSeeds == 0 && torrent.Progress == 0 {
-			addedOn := time.Unix(torrent.AddedOn, 0)
-			if currentTime.Sub(addedOn) > removeAfter {
-				stalled = append(stalled, torrent)
-			}
+		event := log.Trace().
+			Str("torrent", torrent.Name).
+			Str("hash", torrent.Hash).
+			Str("state", torrent.State).
+			Str("debrid_id", torrent.DebridID).
+			Int64("amount_left", torrent.AmountLeft).
+			Int64("dlspeed", torrent.Dlspeed).
+			Float64("progress", torrent.Progress).
+			Int64("last_activity", torrent.LastActivity).
+			Int64("added_on", torrent.AddedOn)
+
+		if torrent.DebridID == "" {
+			event.Msg("Skipping stalled check: torrent has no debrid id")
+			continue
 		}
+		if torrent.State != "downloading" {
+			event.Msg("Skipping stalled check: torrent is not downloading")
+			continue
+		}
+		if torrent.AmountLeft <= 0 {
+			event.Msg("Skipping stalled check: torrent has no remaining bytes")
+			continue
+		}
+		if torrent.Dlspeed > 0 {
+			event.Msg("Skipping stalled check: torrent is still downloading")
+			continue
+		}
+
+		lastActivity := torrent.LastActivity
+		if lastActivity == 0 {
+			lastActivity = torrent.AddedOn
+			event = event.Int64("effective_last_activity", lastActivity)
+			if lastActivity == 0 {
+				event.Msg("Skipping stalled check: torrent has no activity timestamp")
+				continue
+			}
+			event.Msg("Using added_on as fallback last activity for stalled check")
+		}
+		if lastActivity == 0 {
+			event.Msg("Skipping stalled check: torrent has no activity timestamp")
+			continue
+		}
+
+		idleFor := currentTime.Sub(time.Unix(lastActivity, 0))
+		if idleFor > removeAfter {
+			log.Debug().
+				Str("torrent", torrent.Name).
+				Str("hash", torrent.Hash).
+				Dur("idle_for", idleFor).
+				Dur("remove_after", removeAfter).
+				Msg("Torrent marked as stalled")
+			stalled = append(stalled, torrent)
+			continue
+		}
+		log.Trace().
+			Str("torrent", torrent.Name).
+			Str("hash", torrent.Hash).
+			Dur("idle_for", idleFor).
+			Dur("remove_after", removeAfter).
+			Msg("Skipping stalled check: torrent has not exceeded inactivity threshold")
 	}
 	return stalled
 }

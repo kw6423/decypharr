@@ -3,9 +3,10 @@ package wire
 import (
 	"context"
 	"fmt"
+	"time"
+
 	"github.com/go-co-op/gocron/v2"
 	"github.com/sirrobot01/decypharr/internal/utils"
-	"time"
 )
 
 func (s *Store) addToQueue(importReq *ImportRequest) error {
@@ -50,11 +51,13 @@ func (s *Store) StartQueueWorkers(ctx context.Context) error {
 
 	if s.removeStalledAfter > 0 {
 		// Stalled torrents removal job
+		s.logger.Debug().Str("remove_after", s.removeStalledAfter.String()).Msg("Enabling stalled torrent cleanup job")
 		if jd, err := utils.ConvertToJobDef("1m"); err != nil {
 			s.logger.Error().Err(err).Msg("Failed to convert remove stalled torrents interval to job definition")
 		} else {
 			// Schedule the job
 			if _, err := s.scheduler.NewJob(jd, gocron.NewTask(func() {
+				s.logger.Trace().Str("remove_after", s.removeStalledAfter.String()).Msg("Running stalled torrent cleanup")
 				err := s.removeStalledTorrents(ctx)
 				if err != nil {
 					s.logger.Error().Err(err).Msg("Failed to process remove stalled torrents")
@@ -65,6 +68,8 @@ func (s *Store) StartQueueWorkers(ctx context.Context) error {
 				s.logger.Trace().Msgf("Remove stalled torrents job scheduled for every %s", "1m")
 			}
 		}
+	} else {
+		s.logger.Debug().Msg("Stalled torrent cleanup job disabled because remove_stalled_after is not greater than zero")
 	}
 
 	// Start the scheduler
@@ -129,11 +134,22 @@ func (s *Store) removeStalledTorrents(ctx context.Context) error {
 	// This function checks for stalled torrents and removes them
 	stalledTorrents := s.torrents.GetStalledTorrents(s.removeStalledAfter)
 	if len(stalledTorrents) == 0 {
+		s.logger.Trace().Str("remove_after", s.removeStalledAfter.String()).Msg("No stalled torrents matched cleanup criteria")
 		return nil // No stalled torrents to remove
 	}
 
+	s.logger.Debug().Int("count", len(stalledTorrents)).Str("remove_after", s.removeStalledAfter.String()).Msg("Found stalled torrents eligible for cleanup")
 	for _, torrent := range stalledTorrents {
-		s.logger.Warn().Msgf("Removing stalled torrent: %s", torrent.Name)
+		s.logger.Warn().
+			Str("torrent", torrent.Name).
+			Str("hash", torrent.Hash).
+			Str("category", torrent.Category).
+			Int64("last_activity", torrent.LastActivity).
+			Int64("added_on", torrent.AddedOn).
+			Float64("progress", torrent.Progress).
+			Int64("dlspeed", torrent.Dlspeed).
+			Int64("amount_left", torrent.AmountLeft).
+			Msg("Removing stalled torrent")
 		s.torrents.Delete(torrent.Hash, torrent.Category, true) // Remove from store and delete from debrid
 	}
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/request"
@@ -60,9 +61,26 @@ func (s *Store) processFiles(torrent *Torrent, debridTorrent *types.Torrent, imp
 	backoff := time.NewTimer(s.refreshInterval)
 	defer backoff.Stop()
 	for debridTorrent.Status != "downloaded" {
+		if s.torrents.Get(torrent.Hash, torrent.Category) == nil {
+			s.logger.Debug().
+				Str("hash", torrent.Hash).
+				Str("category", torrent.Category).
+				Str("torrent", torrent.Name).
+				Msg("Stopping torrent processing because torrent is no longer tracked")
+			return
+		}
 		s.logger.Debug().Msgf("%s <- (%s) Download Progress: %.2f%%", debridTorrent.Debrid, debridTorrent.Name, debridTorrent.Progress)
 		dbT, err := client.CheckStatus(debridTorrent)
 		if err != nil {
+			if s.torrents.Get(torrent.Hash, torrent.Category) == nil {
+				s.logger.Debug().
+					Str("hash", torrent.Hash).
+					Str("category", torrent.Category).
+					Str("torrent", torrent.Name).
+					Err(err).
+					Msg("Ignoring torrent status error because torrent was already removed")
+				return
+			}
 			s.logger.Error().
 				Str("torrent_id", debridTorrent.Id).
 				Str("torrent_name", debridTorrent.Name).
@@ -103,6 +121,15 @@ func (s *Store) processFiles(torrent *Torrent, debridTorrent *types.Torrent, imp
 	timer := time.Now()
 
 	onFailed := func(err error) {
+		if s.torrents.Get(torrent.Hash, torrent.Category) == nil {
+			s.logger.Debug().
+				Str("hash", torrent.Hash).
+				Str("category", torrent.Category).
+				Str("torrent", torrent.Name).
+				Err(err).
+				Msg("Skipping failure handling because torrent is no longer tracked")
+			return
+		}
 		s.markTorrentAsFailed(torrent)
 		go func() {
 			if deleteErr := client.DeleteTorrent(debridTorrent.Id); deleteErr != nil {
@@ -114,6 +141,15 @@ func (s *Store) processFiles(torrent *Torrent, debridTorrent *types.Torrent, imp
 	}
 
 	onSuccess := func(torrentSymlinkPath string) {
+		if s.torrents.Get(torrent.Hash, torrent.Category) == nil {
+			s.logger.Debug().
+				Str("hash", torrent.Hash).
+				Str("category", torrent.Category).
+				Str("torrent", torrent.Name).
+				Str("torrent_path", torrentSymlinkPath).
+				Msg("Skipping success handling because torrent is no longer tracked")
+			return
+		}
 		torrent.TorrentPath = torrentSymlinkPath
 		s.updateTorrent(torrent, debridTorrent)
 		s.logger.Info().Msgf("Adding %s took %s", debridTorrent.Name, time.Since(timer))
@@ -261,10 +297,10 @@ func (s *Store) partialTorrentUpdate(t *Torrent, debridTorrent *types.Torrent) *
 		return t
 	}
 
-	addedOn, err := time.Parse(time.RFC3339, debridTorrent.Added)
-	if err != nil {
-		addedOn = time.Now()
-	}
+	previousProgress := t.Progress
+	previousDownloaded := t.Downloaded
+	previousSpeed := t.Dlspeed
+	addedOn := parseDebridAdded(debridTorrent.Debrid, debridTorrent.Added)
 	totalSize := debridTorrent.Bytes
 	progress := (cmp.Or(debridTorrent.Progress, 0.0)) / 100.0
 	if math.IsNaN(progress) || math.IsInf(progress, 0) {
@@ -288,6 +324,7 @@ func (s *Store) partialTorrentUpdate(t *Torrent, debridTorrent *types.Torrent) *
 			Size:  file.Size,
 		})
 	}
+	s.logger.Debug().Str("addedon", addedOn.String()).Send()
 	t.DebridID = debridTorrent.Id
 	t.Name = debridTorrent.Name
 	t.AddedOn = addedOn.Unix()
@@ -306,6 +343,50 @@ func (s *Store) partialTorrentUpdate(t *Torrent, debridTorrent *types.Torrent) *
 	t.Eta = eta
 	t.Dlspeed = speed
 	t.Upspeed = speed
+	if t.LastActivity == 0 {
+		t.LastActivity = addedOn.Unix()
+	}
+	if sizeCompleted > previousDownloaded || progress > previousProgress || speed > 0 || previousSpeed > 0 && speed != previousSpeed {
+		t.LastActivity = time.Now().Unix()
+	}
+	return t
+}
+
+func parseDebridAdded(debrid, value string) time.Time {
+	if value == "" {
+		return time.Now()
+	}
+
+	// Default path: trust RFC3339 as sent.
+	if debrid != "realdebrid" {
+		t, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			return time.Now()
+		}
+		return t
+	}
+
+	// Real-Debrid returns the time in UTC format but it's Local time, this is a workaraound.
+	// treat the timestamp as Europe/Paris wall time, ignoring the trailing Z/offset.
+	loc, err := time.LoadLocation("Europe/Paris")
+	if err != nil {
+		return time.Now()
+	}
+
+	layout := "2006-01-02T15:04:05.000"
+	raw := strings.TrimSuffix(value, "Z")
+	raw = strings.TrimSuffix(raw, "+00:00")
+
+	t, err := time.ParseInLocation(layout, raw, loc)
+	if err != nil {
+		// fallback to normal RFC3339 parsing if format differs
+		t2, err2 := time.Parse(time.RFC3339, value)
+		if err2 != nil {
+			return time.Now()
+		}
+		return t2
+	}
+
 	return t
 }
 
